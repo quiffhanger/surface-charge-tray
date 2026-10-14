@@ -13,6 +13,7 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $scriptPath = $MyInvocation.MyCommand.Definition
     Start-Process powershell -Verb RunAs -ArgumentList @(
+        '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
         '-WindowStyle', 'Hidden',
         '-File', "`"$scriptPath`""
@@ -20,18 +21,33 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit
 }
 
-# --- Error logging ---
+# --- Single instance (a second copy would add a duplicate tray icon) ---
+$script:Mutex = New-Object System.Threading.Mutex($false, 'Local\SurfaceChargeTray')
+try {
+    $owned = $script:Mutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    $owned = $true   # previous instance died without releasing; we own it now
+}
+if (-not $owned) { exit }
+
+# --- Error logging (rotated at 1 MB) ---
 $script:LogFile = Join-Path $env:USERPROFILE 'SurfaceChargeTray.log'
+if ((Test-Path $script:LogFile) -and (Get-Item $script:LogFile).Length -gt 1MB) {
+    Move-Item $script:LogFile "$script:LogFile.old" -Force -ErrorAction SilentlyContinue
+}
 function Write-Log {
     param([string]$Msg)
-    "$(Get-Date -Format 'HH:mm:ss') $Msg" | Out-File $script:LogFile -Append
+    try {
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Msg" | Out-File $script:LogFile -Append
+    } catch {}
 }
-Write-Log 'Starting SurfaceChargeTray'
+Write-Log "Starting SurfaceChargeTray (PID $PID, $($MyInvocation.MyCommand.Definition))"
 
 # --- Hide the console window ---
 Add-Type -Name Win32 -Namespace Native -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
 '@
 $consoleHwnd = [Native.Win32]::GetConsoleWindow()
 if ($consoleHwnd -ne [IntPtr]::Zero) {
@@ -43,9 +59,22 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# Log exceptions from event handlers instead of showing the WinForms crash dialog
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode('CatchException')
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    Write-Log "Unhandled UI exception: $($e.Exception)"
+})
+
 # --- Load Surface Battery DM assemblies ---
-$hub = (Get-AppxPackage -Name 'Microsoft.SurfaceHub' -ErrorAction SilentlyContinue).InstallLocation
+# At logon the AppX package can take a while to register, so retry for ~2 minutes
+$hub = $null
+for ($i = 0; $i -lt 24 -and -not $hub; $i++) {
+    $hub = (Get-AppxPackage -Name 'Microsoft.SurfaceHub' -ErrorAction SilentlyContinue).InstallLocation
+    if (-not $hub) { Start-Sleep -Seconds 5 }
+}
 if (-not $hub) {
+    Write-Log 'Surface app not found; exiting'
     [System.Windows.Forms.MessageBox]::Show(
         "Surface app not found. Please install it from the Microsoft Store.",
         "Surface Charge Tray", "OK", "Error")
@@ -59,6 +88,7 @@ try {
     [System.Reflection.Assembly]::LoadFrom("$svc\Microsoft.Extensions.DependencyInjection.Abstractions.dll") | Out-Null
     $script:Asm = [System.Reflection.Assembly]::LoadFrom("$svc\BatteryDm.exe")
 } catch {
+    Write-Log "Failed to load Surface battery assemblies from ${svc}: $_"
     [System.Windows.Forms.MessageBox]::Show(
         "Failed to load Surface battery assemblies: $_",
         "Surface Charge Tray", "OK", "Error")
@@ -151,7 +181,11 @@ function New-TrayIcon {
     $font.Dispose()
     $brush.Dispose()
     $sf.Dispose()
-    $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $hIcon = $bmp.GetHicon()
+    $tempIcon = [System.Drawing.Icon]::FromHandle($hIcon)
+    $icon = $tempIcon.Clone()   # independent copy that owns its own handle
+    $tempIcon.Dispose()
+    [Native.Win32]::DestroyIcon($hIcon) | Out-Null
     $bmp.Dispose()
     return $icon
 }
@@ -246,6 +280,8 @@ function Build-ContextMenu {
     # Exit
     $exitItem = $menu.Items.Add('Exit')
     $exitItem.Add_Click({
+        $script:Exiting = $true
+        Write-Log 'Exit requested'
         $script:NotifyIcon.Visible = $false
         $script:NotifyIcon.Dispose()
         $script:Timer.Stop()
@@ -253,33 +289,49 @@ function Build-ContextMenu {
         [System.Windows.Forms.Application]::Exit()
     })
 
+    # Catch up on any refresh that was skipped while the menu was open
+    $menu.Add_Closed({ Update-TrayState })
+
     return $menu
 }
 
 # --- Update tray icon and menu ---
+$script:LastMode = -1
+$script:LastText = $null
+$script:StaleMenu = $null
+
 function Update-TrayState {
+    if ($script:Exiting) { return }
     try {
         $state = Get-ChargeMode
-        Write-Log "State: Mode=$($state.Mode) Limit=$($state.LimitPercent) Timeout=$($state.TimeoutSeconds)"
+        $mode = if ($state) { $state.Mode } else { $null }
+        $text = if ($state) { "Surface Charge: $(Get-ModeDisplayText $state)" } else { 'Surface Charge: Error reading state' }
 
-        # Update icon
-        if ($state) {
-            switch ($state.Mode) {
-                0 { $script:NotifyIcon.Icon = New-TrayIcon 'A' ([System.Drawing.Color]::DodgerBlue) }
-                1 { $script:NotifyIcon.Icon = New-TrayIcon '80' ([System.Drawing.Color]::ForestGreen) }
-                2 { $script:NotifyIcon.Icon = New-TrayIcon '100' ([System.Drawing.Color]::OrangeRed) }
+        # Only redraw the icon when the mode changes (keeps GDI churn near zero)
+        if ($mode -ne $script:LastMode) {
+            Write-Log "State: Mode=$mode Limit=$($state.LimitPercent) Timeout=$($state.TimeoutSeconds)"
+            $oldIcon = $script:NotifyIcon.Icon
+            switch ($mode) {
+                0       { $script:NotifyIcon.Icon = New-TrayIcon 'A' ([System.Drawing.Color]::DodgerBlue) }
+                1       { $script:NotifyIcon.Icon = New-TrayIcon '80' ([System.Drawing.Color]::ForestGreen) }
+                2       { $script:NotifyIcon.Icon = New-TrayIcon '100' ([System.Drawing.Color]::OrangeRed) }
+                default { $script:NotifyIcon.Icon = New-TrayIcon '?' ([System.Drawing.Color]::Gray) }
             }
-            $script:NotifyIcon.Text = "Surface Charge: $(Get-ModeDisplayText $state)"
-        } else {
-            $script:NotifyIcon.Icon = New-TrayIcon '?' ([System.Drawing.Color]::Gray)
-            $script:NotifyIcon.Text = "Surface Charge: Error reading state"
+            if ($oldIcon) { $oldIcon.Dispose() }
+            $script:LastMode = $mode
         }
 
-        # Rebuild context menu
-        $oldMenu = $script:NotifyIcon.ContextMenuStrip
-        $script:NotifyIcon.ContextMenuStrip = Build-ContextMenu $state
-        if ($oldMenu) { $oldMenu.Dispose() }
-        Write-Log "Menu built with $($script:NotifyIcon.ContextMenuStrip.Items.Count) items"
+        # Rebuild the menu only when its content changes, and never while it is open
+        $current = $script:NotifyIcon.ContextMenuStrip
+        if ($text -ne $script:LastText -and -not ($current -and $current.Visible)) {
+            $script:NotifyIcon.Text = $text
+            # The old menu may be the one whose Click handler is running right now,
+            # so dispose it on the next refresh rather than immediately
+            if ($script:StaleMenu) { $script:StaleMenu.Dispose() }
+            $script:StaleMenu = $current
+            $script:NotifyIcon.ContextMenuStrip = Build-ContextMenu $state
+            $script:LastText = $text
+        }
     } catch {
         Write-Log "Update-TrayState ERROR: $_"
     }

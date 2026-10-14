@@ -42,7 +42,9 @@ To have the tray app start automatically at logon with admin privileges, run the
 .\Install-Startup.ps1
 ```
 
-This creates a scheduled task called `SurfaceChargeTray` that runs at logon with highest privileges.
+This copies the script to `%LOCALAPPDATA%\SurfaceChargeTray\`, creates a scheduled task called `SurfaceChargeTray` that runs it at logon with highest privileges, and starts it immediately. Because the task runs the installed copy, moving or deleting this repo won't break startup — but re-run the installer after editing the script to deploy changes.
+
+Logs are written to `%USERPROFILE%\SurfaceChargeTray.log` (rotated to `.old` at 1 MB).
 
 To remove it:
 
